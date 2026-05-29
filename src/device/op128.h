@@ -356,7 +356,7 @@ __device__ __forceinline__ uint64_t ld_volatile_global(uint64_t *ptr) {
 }
 __device__ __forceinline__ uint64_t ld_relaxed_sys_global(uint64_t *ptr) {
   uint64_t ans;
-  ans = __builtin_nontemporal_load(ptr);
+  ans =  __atomic_load_n(ptr, __ATOMIC_RELAXED);
   return ans;
 }
 
@@ -372,7 +372,7 @@ __device__ __forceinline__ uint64_t ld_relaxed_sys_global(uint64_t *ptr) {
 
 __device__ __forceinline__ uint64_t ld_acquire_sys_global(uint64_t *ptr) {
   uint64_t ans;
-  ans = __atomic_load_n(ptr ,__ATOMIC_SEQ_CST);
+  ans = __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
   return ans;
 }
 
@@ -380,14 +380,25 @@ __device__ __forceinline__ void st_volatile_global(uint64_t *ptr, uint64_t val) 
   __builtin_nontemporal_store(val, ptr);
 }
 __device__ __forceinline__ void st_relaxed_sys_global(uint64_t *ptr, uint64_t val) {
-  __builtin_nontemporal_store(val, ptr);
+  __atomic_store_n(ptr, val, __ATOMIC_RELAXED);
 }
 __device__ __forceinline__ void st_release_sys_global(uint64_t *ptr, uint64_t val) {
-  __atomic_store_n(ptr, val, __ATOMIC_SEQ_CST);
+  __atomic_store_n(ptr, val, __ATOMIC_RELEASE);
 }
 
 __device__ __forceinline__ void fence_acq_rel_sys() {
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+    // On GFX9, STORE(connStepPtr, ...) and st_relaxed_sys_global() compile down
+    // to relaxed atomics, so without this fence the proxy can observe the
+    // tail bump before the preceding connFifo[slot].size store has reached
+    // the host cacheline. All four call sites in prims_simple.h gate this on
+    // (flags & ConnFifoEnabled) so only proxy-mediated transfers pay the cost.
+    // (AMD un-gated this from the CSUM compile flag in checksum-branch
+    // bd21fd77 -- the underlying ordering need is independent of CSUM.)
+    __threadfence_system();
+#else
     //asm volatile("membar.sys;" ::: "memory");
+#endif
 }
 __device__ __forceinline__ void fence_acq_rel_gpu() {
     //asm volatile("membar.gl;" ::: "memory");
