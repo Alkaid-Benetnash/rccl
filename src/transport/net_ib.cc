@@ -1239,6 +1239,16 @@ struct ncclIbSendComm {
   struct ncclIbRemSizesFifo remSizesFifo;
 #if RCCL_IB_CHECKSUM_DEVICE_ENABLED
   uint32_t proxyChecksum[MAX_REQUESTS];
+  // SEND_VERIFY GDR bounce resources, lazy-init'd in ncclIbTest() on
+  // first GDR send completion (NULL until then; freed in ncclIbCloseSend).
+  // The dedicated cudaStreamNonBlocking stream + pinned bounce let the
+  // per-completion DeviceToHost copy use cudaMemcpyAsync instead of
+  // synchronous cudaMemcpy: the sync variant routes through the null
+  // stream and creates an implicit per-device barrier per completion,
+  // which on all-IB rings deadlocks against the kernel in waitPeer
+  // waiting for the proxy to free this slot.
+  void*        verifyBouncePinned;     // cudaMallocHost'd, kBounceBytes
+  cudaStream_t verifyStream;           // cudaStreamCreateWithFlags(cudaStreamNonBlocking)
 #endif
   uint64_t fifoHead;
   int ar; // Use adaptive routing when all merged devices have it enabled
@@ -2756,6 +2766,9 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
           && r->send.checksum != NCCL_IB_CHECKSUM_NONE
           && r->send.data != NULL
           && r->send.size > 0) {
+        // r->base aliases &comm->base (ncclIbNetCommBase is the first
+        // member of ncclIbSendComm); downcast to reach verify resources.
+        struct ncclIbSendComm* comm = (struct ncclIbSendComm*)r->base;
         // Apply the SAME byte-count clamp the kernel send site applies in
         // prims_simple.h. r->send.checksum is the kernel's XOR over the
         // first `xorBytes` bytes of the slot, not over the full slot, so
@@ -2787,61 +2800,79 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
           cpuCsum = ncclIbQuickXorCsumHost(r->send.data, (size_t)xorBytes);
           computed = true;
         } else {
-          // GDR path: r->send.data lives in VRAM; CPU dereference is unsafe.
-          // Bounce through a stack-allocated host buffer so the XOR sees
-          // the same bytes the HCA RDMA'd. We only ever bounce `xorBytes`
-          // (== min(slot_size, RCCL_IB_RDMA_CHECKSUM_BYTES)), not the
-          // full slot, so the cap is honoured for PCIe bandwidth too --
-          // and the verify cost scales with the cap, not the slot size.
-          // We chunk by 64 KiB to keep peak working-set predictable and
-          // to fit inside the L2 of the CPU thread doing the XOR.
-          //
-          // Doing a cudaMemcpy from the proxy thread post-completion
-          // adds real per-step latency (extra PCIe DTH read). This
-          // branch is gated by RCCL_IB_RDMA_CHECKSUM_SEND_VERIFY
-          // (default 1); set it to 0 to disable when running
-          // bandwidth-sensitive GDR workloads, or set
-          // RCCL_IB_RDMA_CHECKSUM_BYTES to cap the per-step cost.
+          // GDR path: r->send.data is VRAM; bounce DeviceToHost into a
+          // comm-owned pinned buffer (see struct ncclIbSendComm for the
+          // pinned-bounce + non-blocking-stream rationale), then CPU-XOR.
+          // We only bounce `xorBytes`
+          // (== min(slot_size, RCCL_IB_RDMA_CHECKSUM_BYTES)) so the cap
+          // bounds PCIe traffic too; chunked by 64 KiB to keep peak
+          // working-set predictable and inside the CPU thread's L2.
           enum { kBounceBytes = 65536 };
           static_assert((kBounceBytes & 3) == 0, "bounce must be word-aligned for XOR accumulator");
-          alignas(16) uint8_t bounce[kBounceBytes];
-          uint32_t acc = 0;
-          bool ok = true;
-          size_t off = 0;
-          while (off < (size_t)xorBytes) {
-            size_t chunk = (size_t)xorBytes - off;
-            if (chunk > kBounceBytes) chunk = kBounceBytes;
-            cudaError_t mc = cudaMemcpy(bounce, (const uint8_t*)r->send.data + off, chunk, cudaMemcpyDeviceToHost);
-            if (mc != cudaSuccess) {
+          if (comm->verifyBouncePinned == NULL) {
+            cudaError_t ae = cudaMallocHost(&comm->verifyBouncePinned, kBounceBytes);
+            if (ae != cudaSuccess) {
+              comm->verifyBouncePinned = NULL;
               if (rcclParamIbRdmaChecksumTrace()) {
-                TRACE(NCCL_NET, "NET/IB: send csum verify skipped (cudaMemcpy err=%d off=%zu chunk=%zu xor=%d size=%d)",
-                      (int)mc, off, chunk, xorBytes, r->send.size);
+                TRACE(NCCL_NET, "NET/IB: send csum verify skipped (cudaMallocHost err=%d, falling back without verify on this comm)", (int)ae);
               }
-              ok = false;
-              break;
+              goto verify_done;
             }
-            bool isLast = (off + chunk == (size_t)xorBytes);
-            // XOR full 4-byte words; only the very last chunk's tail
-            // (< 4 bytes) is folded the same way ncclIbQuickXorCsumHost
-            // does it, so the streaming result equals the full-buffer
-            // result the kernel produced.
-            size_t i = 0;
-            for (; i + 4 <= chunk; i += 4) {
-              uint32_t w;
-              __builtin_memcpy(&w, bounce + i, sizeof(w));
-              acc ^= w;
-            }
-            if (isLast && i < chunk) {
-              uint32_t tail = 0;
-              __builtin_memcpy(&tail, bounce + i, chunk - i);
-              acc ^= tail;
-            }
-            off += chunk;
           }
-          if (ok) {
-            cpuCsum = acc;
-            computed = true;
+          if (comm->verifyStream == NULL) {
+            cudaError_t se = cudaStreamCreateWithFlags(&comm->verifyStream, cudaStreamNonBlocking);
+            if (se != cudaSuccess) {
+              comm->verifyStream = NULL;
+              if (rcclParamIbRdmaChecksumTrace()) {
+                TRACE(NCCL_NET, "NET/IB: send csum verify skipped (cudaStreamCreate err=%d)", (int)se);
+              }
+              goto verify_done;
+            }
           }
+          {
+            uint8_t* const bounce = (uint8_t*)comm->verifyBouncePinned;
+            uint32_t acc = 0;
+            bool ok = true;
+            size_t off = 0;
+            while (off < (size_t)xorBytes) {
+              size_t chunk = (size_t)xorBytes - off;
+              if (chunk > kBounceBytes) chunk = kBounceBytes;
+              cudaError_t mc = cudaMemcpyAsync(bounce, (const uint8_t*)r->send.data + off, chunk, cudaMemcpyDeviceToHost, comm->verifyStream);
+              if (mc == cudaSuccess) {
+                mc = cudaStreamSynchronize(comm->verifyStream);
+              }
+              if (mc != cudaSuccess) {
+                if (rcclParamIbRdmaChecksumTrace()) {
+                  TRACE(NCCL_NET, "NET/IB: send csum verify skipped (cudaMemcpyAsync/sync err=%d off=%zu chunk=%zu xor=%d size=%d)",
+                        (int)mc, off, chunk, xorBytes, r->send.size);
+                }
+                ok = false;
+                break;
+              }
+              bool isLast = (off + chunk == (size_t)xorBytes);
+              // XOR full 4-byte words; only the very last chunk's tail
+              // (< 4 bytes) is folded the same way ncclIbQuickXorCsumHost
+              // does it, so the streaming result equals the full-buffer
+              // result the kernel produced.
+              size_t i = 0;
+              for (; i + 4 <= chunk; i += 4) {
+                uint32_t w;
+                __builtin_memcpy(&w, bounce + i, sizeof(w));
+                acc ^= w;
+              }
+              if (isLast && i < chunk) {
+                uint32_t tail = 0;
+                __builtin_memcpy(&tail, bounce + i, chunk - i);
+                acc ^= tail;
+              }
+              off += chunk;
+            }
+            if (ok) {
+              cpuCsum = acc;
+              computed = true;
+            }
+          }
+verify_done: ;
         }
         if (computed) {
           if (cpuCsum != r->send.checksum) {
@@ -2980,6 +3011,24 @@ ncclResult_t ncclIbCloseSend(void* sendComm) {
       if (comm->remSizesFifo.mrs[i] != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remSizesFifo.mrs[i]));
       NCCLCHECK(ncclIbDestroyBase(&commDev->base));
     }
+#if RCCL_IB_CHECKSUM_DEVICE_ENABLED
+    // Tear down lazy SEND_VERIFY resources. Errors are non-fatal (comm
+    // is closing); TRACE-gated to keep the hot path quiet.
+    if (comm->verifyStream != NULL) {
+      cudaError_t se = cudaStreamDestroy(comm->verifyStream);
+      if (se != cudaSuccess && rcclParamIbRdmaChecksumTrace()) {
+        TRACE(NCCL_NET, "NET/IB: cudaStreamDestroy err=%d (non-fatal)", (int)se);
+      }
+      comm->verifyStream = NULL;
+    }
+    if (comm->verifyBouncePinned != NULL) {
+      cudaError_t fe = cudaFreeHost(comm->verifyBouncePinned);
+      if (fe != cudaSuccess && rcclParamIbRdmaChecksumTrace()) {
+        TRACE(NCCL_NET, "NET/IB: cudaFreeHost err=%d (non-fatal)", (int)fe);
+      }
+      comm->verifyBouncePinned = NULL;
+    }
+#endif
     free(comm);
   }
   TIME_PRINT("IB");
